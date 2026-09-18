@@ -1,0 +1,18 @@
+{
+  "manifest_version": 3,
+  "name": "Rethread — tab capture",
+  "version": "1.0",
+  "description": "Captures only tab title, domain, and timestamp — never page content.",
+  "permissions": ["tabs"],
+  "host_permissions": ["http://localhost:5173/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["http://localhost:5173/*"],
+      "js": ["content-script.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
