@@ -2,6 +2,8 @@
 
 const state = {
   intent: null,
+  location: null,
+  dueDate: null,
   firstAction: null,
   plans: [],
   events: [],
@@ -54,6 +56,8 @@ function writeJson(key, value) {
 function makeSnapshot() {
   return {
     intent: state.intent,
+    location: state.location,
+    dueDate: state.dueDate,
     firstAction: state.firstAction,
     plans: state.plans,
     events: state.events,
@@ -202,11 +206,15 @@ export function subscribeEvents(callback) {
 
 export function createSession({
   goal,
+  location,
+  dueDate,
   firstAction,
   plans,
   condition = null,
 }) {
   state.intent = goal || null;
+  state.location = location || null;
+  state.dueDate = dueDate || null;
   state.firstAction = firstAction || null;
   state.plans = plans || [];
 
@@ -418,19 +426,14 @@ function archiveCurrentSession() {
         []
       );
 
-    const archivedEvents =
-      state.events.map((event) => ({
-        ...event,
-
-        session_intent:
-          state.intent,
-
-        session_started_at:
-          state.sessionStartedAt,
-
-        session_ended_at:
-          endedAt,
-      }));
+    const archivedEvents = state.events.map((event) => ({
+      ...event,
+      session_intent: state.intent,
+      session_location: state.location,
+      session_due_date: state.dueDate,
+      session_started_at: state.sessionStartedAt,
+      session_ended_at: endedAt,
+    }));
 
     history.push(
       ...archivedEvents
@@ -495,6 +498,9 @@ function archiveCurrentSession() {
       intent:
         state.intent,
 
+      location: state.location,
+      due_date: state.dueDate,
+
       started_at:
         new Date(
           state.sessionStartedAt
@@ -528,6 +534,8 @@ export function endSession() {
   archiveCurrentSession();
 
   state.intent = null;
+  state.location = null;
+  state.dueDate = null;
   state.firstAction = null;
   state.plans = [];
 
