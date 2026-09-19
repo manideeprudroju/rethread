@@ -3,17 +3,19 @@ import json
 import re
 import time
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from model_provider import build_agent
 from decompose_guardrail import (
     BANNED_PHRASES,
+    PHYSICAL_VERBS,
     REAL_FILE_RE,
     CLARIFY_STRICT,
     filter_clarify_questions,
     SYSTEM_PROMPT as DECOMPOSE_PROMPT,
     failure_summary,
     safe_fallback,
+    secret_exposure_hits,
     validate,
 )
 from seq_check import check_sequential
@@ -22,86 +24,108 @@ from seq_check import check_sequential
 # AMEND
 # --------------------------------------------------------------------------
 
+# Written the way it should sound. The model copies the register of its
+# prompt: the old one was all prohibitions in formal English ("I cannot see
+# the contents page"), and the replies came back the same way. The hard
+# lines are unchanged, and the validator still enforces every one of them.
 SESSION_PROMPT = """\
-You are mid-session with someone with ADHD. They have a goal, a step they \
-are on, plans, and a record of what they have said. They just said \
-something. Answer it, and leave them with one physical step.
+You're the chat inside a work tool for people with ADHD. Someone is partway \
+through a piece of work and has just messaged you. Talk to them like a sharp \
+friend who knows the subject: direct, warm, plain words, contractions. Then \
+make sure they still have one physical step to take.
 
-You return TWO things, and they do different jobs.
+Return JSON with these fields.
 
-response - what you actually say to them. This is a conversation. A \
-question gets an answer. A blocker gets the way round it. "Which topics \
-first" gets an actual order, not a redirection. Under 50 words, plain \
-sentences, no lists.
-   ANSWER FROM WHAT YOU HAVE. You cannot see their files or screen. When \
-the answer depends on something in front of them, say so in a few words \
-and make finding it the step: "I cannot see the contents page. Open LA.pdf \
-and type the chapter names here and I will put them in order."
-   You may use what you know about a subject in general. You may NOT state \
-anything specific about THEIR material - what is in their file, how long \
-it is, which chapter they are on - unless they told you.
-   Prefer answering from the available context. Ask at most one question
-only when the missing information materially changes the next action, and
-never instead of the step. If you already asked them something and they
-replied, do not ask it again - act on what they gave you, however thin.
-   Not a lecture, not a list of options, not a pep talk. One answer.
+response - what you say back. This is the chat message they read.
+  - Answer what they actually said. A question gets a real answer, with the \
+reason when it helps: "which topics first?" gets an order, "what's PCA?" gets \
+an explanation, a blocker gets the way round it. If they're just telling you \
+something, respond to what they told you, the way a person would.
+  - Use what you know about the subject freely. What you can't know is THEIR \
+material: what's in their files, which page they're on, what their error \
+says. Don't state those. If the answer depends on something only they can \
+see, say so in a few words and make getting it the step: "I can't see your \
+contents page. Paste the chapter names here and I'll put them in order."
+  - Usually one to three sentences; up to about 60 words when they asked you \
+to explain something. No lists or headings.
+  - At most one question, and only when the answer would change what they do \
+next. If you asked something last turn and they replied, use the reply, \
+however short. Never ask again, and never ask for a filename.
+  - If they can't or won't do the step ("idk", "nope", "still can't"), don't \
+ask for the same thing again. Make the step smaller, or come at it another \
+way. Your help never waits on them doing something first.
+  - When you're guessing about their code, data or setup, say it's a guess \
+("usually", "probably"). Don't send them somewhere they never mentioned, like \
+their email or a folder.
+  - The step is shown to them separately, so don't repeat it here unless your \
+answer is about the step.
 
-first_action - the ONE physical step that stands right now, under 20 \
-words. A stranger watching their screen could say whether they did it. \
-"Check", "review", "look at", "see if", "verify", "make sure" and "figure \
-out" are NOT observable. Write the act instead:
-     BAD:  "Check if October data is in another tab"
-     GOOD: "Open the other tab and search for October"
-   If nothing they said changes the step, REPEAT the one they already \
-have. Repeating is not a failure to answer; it is the truth - nothing has \
-moved yet.
-   null ONLY when kind is "done". Every other turn leaves them something \
-they can do right now.
+first_action - the ONE physical thing to do right now, under 20 words, \
+starting with a verb like Open, Type, Paste, Read, Scroll, Write or Run. \
+Someone watching their screen could tell whether they did it. "Check", \
+"review", "look at", "see if", "figure out" and "make sure" aren't physical, \
+so write the act instead:
+    BAD:  "Check if October is in the other tab"
+    GOOD: "Open the other tab and search for October"
+  If nothing they said changes the step, return the step they already have. \
+That's normal: nothing has moved yet.
+  When they can't start writing, the best step is often the exact words to \
+type: "Type 'The short version is:' at the top".
+  null ONLY when kind is "done".
 
-kind - what this message does to the SESSION. Not a category for their \
-mood or their message:
-  continue     - the session carries on. Progress, a blocker, a question, \
-thinking out loud, a half-formed thought: all of it is "continue".
+kind - what the message does to the session, not a label for their mood:
+  continue     - the work carries on. Progress, a blocker, a question, small \
+talk, thinking out loud: all "continue".
   scope_change - the work itself changed. Set revised_intent.
   done         - the work is finished. first_action is null.
 
-revised_intent - ONLY when kind is "scope_change". The work they are now \
-doing, in their words, under 15 words. Null otherwise.
+revised_intent - only for scope_change: the work they're doing now, in their \
+words, under 15 words. Otherwise null.
 
-plans - normally 0 or 1. Up to 3 only if their message genuinely opened \
-several distinct sticking points. Only include plans that are NEW given \
-what they just told you; if their existing plans still cover it, return an \
-empty list.
-   Each "if" must be a SITUATION THEY WILL ENCOUNTER, never the previous \
-step finishing. "if the tests still fail" is a trigger. "if I finish \
-editing the file" is a to-do list, and is forbidden.
+plans - usually an empty list. Add one if-then plan only when their message \
+raised a new sticking point that their existing plans don't cover (never more \
+than 3). The "if" is a situation they'll run into ("if the tests still fail"), \
+never the previous step finishing ("if I finish the file" is a to-do list). \
+Write plans in their voice: "if I get stuck", not "if you get stuck".
 
-note - under 15 words, what changed, for the record. Factual. Not a \
-summary of their progress, not a reaction.
+note - under 15 words: what changed, for the record. They never see it.
 
-DO NOT:
-- Restart the session or hand back a whole new plan. One thing changed; \
+HOW IT SHOULD SOUND
+  They said: "should i memorise the derivations?"
+  Good:  "Not word for word. Know which idea each step uses, because that's \
+what gets you through a version you haven't seen before."
+  Stiff: "Do not memorise derivations. Understand each step."
+
+  They said: "ugh this chapter is so dry"
+  Good:  "Dry chapters go down easier in small bites. Read to the first \
+worked example, then decide whether to carry on."
+  That's not a pep talk and not sympathy about them. It's a way through the \
+work.
+
+  They said: "nope"
+  Good:  "Fair enough, let's make it smaller. What's the last line on your \
+screen? Paste just that."
+  Stiff: "Without that, I can't help you."
+
+  Start with the substance. Don't open with a verdict ("Good.", "Perfect.", \
+"Good catch."), don't repeat back what they just said, and skip stock lines \
+like "starting is the hardest part".
+
+HARD LINES
+- No praise or cheerleading: no "great job", "nice work", "you've got this", \
+"keep going", "don't worry". React to the work, not to how they're doing.
+- Never mention how long anything took, how often they've been stuck or come \
+back, or anything about focus, distraction, motivation or procrastination. \
+Say "start with" or "put X first", never "focus on".
+- Never describe or diagnose them ("you seem tired", "you tend to"). Talk \
+about the work.
+- Grounding: never write a filename, a line, page or question number, a \
+function name, or any detail of their material they didn't tell you. Your \
+own earlier replies aren't evidence. Something they mentioned without a \
+name ("the pdf", "my notes") is fine to refer to; something they never \
+mentioned doesn't exist.
+- Don't restart the session or hand back a new plan. One thing changed; \
 change one thing.
-- Mention how long anything took, how many times they have been back, \
-that they lost time, or anything about focus or distraction.
-- Congratulate, encourage, reassure, or comment on how they are doing. \
-No "great", "nice work", "you're making progress", "don't worry".
-- Diagnose or characterise them. Talk about the work only.
-
-GROUNDING: you have only what THEY told you - their goal, their answers, \
-their messages. You have NOT seen their files, screen, or terminal, and \
-your own earlier replies are not evidence. Never write a line number, \
-function name, filename, or any identifier they did not say. If they said \
-"the tests fail" and nothing else, you do not know which test. A made-up \
-specific costs them the session.
-   An artifact named without a name is still named. "the pdf", "my notes", \
-"that sheet" are enough to act on: write "Open the PDF you are studying \
-from and read the first heading". Never ask them for a filename. And \
-never assert one that was not mentioned at all - if they named no \
-artifact, name none.
-
-Write plans in the first person, as their own voice: "if I get stuck", not \
-"if you get stuck".
 
 Respond with ONLY a JSON object, no fences, no preamble:
 {"kind": "...", "response": "...", "first_action": "..."|null, \
@@ -130,6 +154,26 @@ class SessionOutput(BaseModel):
     # client or a stored session from the old shape still parses.
     question: str | None = None
 
+    @model_validator(mode="after")
+    def _tidy(self):
+        """Deterministic clean-up, before the validator ever sees the reply.
+
+        Runs wherever this model is built from the model's output (Strands
+        structured output, in the Lambda and the harness). Two things that
+        used to cost a whole second model call, or the turn:
+          - an opening "Good." / "Perfect." / "Good catch." is removed. It was
+            half of all rejections, and the repaired reply came back flatter
+            than the original minus one word.
+          - a note that breaks the tone rules is replaced with a neutral one.
+            The note is internal: the user never sees it and the model is
+            never shown it again. "Still stuck on first sentence" in it threw
+            away good replies and ended in the canned fallback.
+        """
+        self.response = strip_opening_praise(self.response)
+        if not note_is_clean(self.note):
+            self.note = NEUTRAL_NOTES.get(normalise_kind(self.kind), "Turn recorded.")
+        return self
+
 
 AmendOutput = SessionOutput
 
@@ -146,6 +190,8 @@ class DecomposeOutput(BaseModel):
 
 VALID_KINDS = {"continue", "scope_change", "done"}
 
+RESPONSE_MAX_WORDS = 70
+
 KIND_ALIASES = {"progress": "continue", "blocker": "continue",
                 "unclear": "continue", "question": "continue",
                 "chat": "continue", "finished": "done", "complete": "done"}
@@ -156,12 +202,53 @@ def normalise_kind(kind):
     return KIND_ALIASES.get(k, k)
 
 
+# "so far" and "once more" are gone from this list: they rejected "paste what
+# you have so far" and "run it once more". "so far you" is still banned in
+# AMEND_BANNED, which is the accounting shape.
 SESSION_NARRATION = [
     "as i mentioned", "as i said", "like last time", "earlier you",
     "you've tried", "you have tried", "third time", "second time",
-    "back again", "so far", "up to now", "we've been", "we have been",
-    "still stuck", "once more", "yet again", "once again",
+    "back again", "up to now", "we've been", "we have been",
+    "still stuck", "yet again", "once again",
 ]
+
+# Fine when it echoes their own words: "still stuck on the proof" can get
+# "If you're still stuck...". Counting phrases stay banned even then.
+NARRATION_ECHO_OK = {"still stuck"}
+
+# The prompt forbids describing the person; this makes the common shapes
+# checkable. Talking about the work never needs them.
+CHARACTERISING = [
+    "you seem", "you sound", "you look like you", "you appear to",
+    "you're clearly", "you are clearly", "you tend to", "your adhd",
+    "adhd brain",
+]
+
+# Help that waits on them. Caught live, to someone replying "nope": "Without
+# the error message, I can't help you fix the test. Either paste it here or
+# look at it yourself." The fix for a stalled step is a smaller step.
+CONDITIONAL_HELP = [
+    "i can't help", "i cannot help", "can't help you", "cannot help you",
+    "look at it yourself", "not much i can do",
+]
+
+NEUTRAL_NOTES = {"continue": "Turn recorded.", "scope_change": "The work changed.",
+                 "done": "Work finished."}
+
+# Words in quotes are words to type or search for, not claims about their
+# material: "Type 'This report summarizes Q3 results'" does not assert that
+# they have results, and it is the most useful step there is for a blank
+# page. Quoted spans skip the content, artifact and numbered-reference
+# checks. Filenames are still checked inside quotes. The single-quote form
+# needs a non-letter on the outside, so "you're" is not a quote.
+QUOTED_RE = re.compile(
+    "\"[^\"\\n]{1,200}\"|\u201c[^\u201d\\n]{1,200}\u201d|\u2018[^\u2019\\n]{1,200}\u2019"
+    "|(?<![\\w'])'(?=\\S)[^'\\n]{0,199}?(?<=\\S)'(?![\\w'])"
+)
+
+
+def _unquote(text):
+    return QUOTED_RE.sub("it", str(text or ""))
 
 
 
@@ -309,23 +396,85 @@ def invented_numbered(text, context):
                    if m.group(0) not in ctx})
 
 
-def grounding_checks(text, context, include_artifacts=True):
+def grounding_checks(text, context, include_artifacts=True, quoted_ok=False):
     """The grounding checks that apply to any user-facing string.
 
     Questions are exempt from assertion-grounding because asking for missing
     information is legitimate. Statements and actions remain grounded.
+    quoted_ok: quoted spans are words to type, not claims (see QUOTED_RE).
+    Filenames are checked in the raw text either way.
     """
     grounded_text = _without_questions(text)
+    free = _unquote(grounded_text) if quoted_ok else grounded_text
     out = [
         ("no invented filenames", invented_filenames(grounded_text, context)),
-        ("no reference to work they never mentioned", invented_priors(grounded_text, context)),
-        ("no invented numbered reference", invented_numbered(grounded_text, context)),
-        ("no unsupported content assumptions", invented_content(grounded_text, context)),
+        ("no reference to work they never mentioned", invented_priors(free, context)),
+        ("no invented numbered reference", invented_numbered(free, context)),
+        ("no unsupported content assumptions", invented_content(free, context)),
     ]
     if include_artifacts:
         out.append(("no artifact they never mentioned",
-                    invented_artifacts(grounded_text, context)))
+                    invented_artifacts(free, context)))
     return out
+
+
+# Sentences that tell them to DO something get the full grounding check,
+# because they send someone looking for a thing that may not exist.
+# Sentences that explain use "the data", "the syllabus", "the results" in
+# their general sense ("PCA finds the directions where the data varies
+# most"), and grounding those like instructions left the chat unable to
+# explain anything. There, only a claim that THEY have something ("your
+# notes") must be grounded.
+INSTRUCTION_VERBS = set(PHYSICAL_VERBS) | {
+    "use", "find", "grab", "pull", "put", "check", "look", "start", "try",
+    "do", "pick", "skip", "jump", "head", "switch", "take", "fill", "list",
+    "note", "mark", "draw", "solve", "answer", "watch", "load", "call",
+    "download", "upload", "install", "import", "finish", "keep", "reread",
+}
+_LEAD_WORDS = r"(?:(?:just|now|then|so|first|next|and|also|maybe|ok|okay)\s+)*"
+_MODAL = (r"(?:you\s+(?:should|could|can|need\s+to|might\s+want\s+to|"
+          r"will\s+want\s+to|['’]ll\s+want\s+to)\s+)?")
+CLAUSE_START_RE = re.compile(r"^[^a-z]*" + _LEAD_WORDS + _MODAL + r"([a-z']+)")
+
+
+def _is_instruction(sentence):
+    """Does any clause of this sentence tell them to do something?"""
+    for clause in re.split(r"[,;:]|\s[-–—]\s", sentence.lower()):
+        m = CLAUSE_START_RE.match(clause.strip())
+        if m and m.group(1) in INSTRUCTION_VERBS:
+            return True
+    return False
+
+
+def _claims_theirs(hits):
+    return [h for h in hits if h.split() and h.split()[0] in ("your", "their")]
+
+
+def response_grounding_checks(text, context):
+    """Grounding for the chat reply. Same rule names as grounding_checks.
+
+    Filenames use REAL_FILE_RE (known extensions): the loose pattern flagged
+    "e.g." and "df.head()" as invented files, and a coding answer could not
+    name a library call. Only question SENTENCES are exempt now. Stripping
+    everything up to a "?" also exempted the statements before it, so
+    "Open utils.py. Which line fails?" was never checked.
+    """
+    sents = [s for s in _sentences(text) if not s.rstrip().endswith("?")]
+    body = " ".join(sents)
+    told = " ".join(_unquote(s) for s in sents if _is_instruction(s))
+    said = " ".join(_unquote(s) for s in sents if not _is_instruction(s))
+    ctx = re.sub(r"\s+", " ", (context or "").lower())
+    files = sorted({f for f in REAL_FILE_RE.findall(body) if f.lower() not in ctx})
+    return [
+        ("no invented filenames", files),
+        ("no reference to work they never mentioned",
+         invented_priors(_unquote(body), context)),
+        ("no invented numbered reference", invented_numbered(told, context)),
+        ("no unsupported content assumptions",
+         invented_content(told, context) + _claims_theirs(invented_content(said, context))),
+        ("no artifact they never mentioned",
+         invented_artifacts(told, context) + _claims_theirs(invented_artifacts(said, context))),
+    ]
 
 
 QUESTION_RE = re.compile(r"([^.!?\n]*\?)")
@@ -410,39 +559,103 @@ def _stalled_last_turn(session):
     return bool(hist) and not str(hist[-1].get("action") or "").strip()
 
 
-def _phrase_hits(text, phrases):
+# Stems in BANNED_PHRASES are meant to catch every form of the word. Matched
+# with a word boundary on both sides, they only matched the bare stem, which
+# never appears: "you seem distracted" and "procrastinating" went straight
+# through the one rule the whole product is built around.
+STEM_PHRASES = {"distract", "procrastinat", "motivat"}
+
+
+def _sentences(text):
+    return [s.strip() for s in re.split(r"(?<=[.!?])\s+|\n+", str(text or ""))
+            if s.strip()]
+
+
+def _phrase_hits(text, phrases, praise=False):
     """Word-boundary matching, plus narrow standalone praise detection.
 
     `"again" in "Run the test again"` is a true substring match and a false
     positive. Matching on boundaries also stops "finally" firing inside
-    "finalise" and "so far" inside "also farther".
+    "finalise" and "so far" inside "also farther". Stems match as prefixes.
 
-    Bare "good" is handled separately because it is praise at the start of a
-    response ("Good. Now ...") but can be legitimate inside substantive text.
+    praise=True also checks each sentence's opening: "Great. Now ..." is
+    praise, "flashcards are great for recall" is not. Only the praise rule
+    asks for it. It used to run inside every rule, so one "Good." was
+    reported three times, as praise, as narration and as "talks about the
+    person", and the repair was told all three.
     """
     text = str(text or "")
     out = []
     for p in phrases:
-        if re.search(r"(?<!\w)" + re.escape(p) + r"(?!\w)", text):
+        tail = "" if p in STEM_PHRASES else r"(?!\w)"
+        if re.search(r"(?<!\w)" + re.escape(p) + tail, text):
             out.append(p)
-    if STANDALONE_PRAISE_RE.search(text.strip()):
-        out.append("standalone praise: good")
+    if praise:
+        for s in _sentences(text):
+            m = STANDALONE_PRAISE_RE.search(s)
+            if m:
+                out.append(f"standalone praise: {m.group(1).lower()}")
+                break
     return out
 
+
+# Opening praise as a whole interjection ("Good.", "Perfect!", "Good catch.",
+# "Good - "), which _tidy removes. Anything it can't remove cleanly ("Good
+# call on checking the middleware") is left for the validator to reject.
+OPENING_PRAISE_RE = re.compile(
+    r"^\s*(?:good|great|nice|awesome|perfect|excellent|amazing|brilliant|"
+    r"lovely|fantastic|wonderful)(?:\s+[a-z']+)?\s*(?:[.!,;:]+|[-–—]+)\s*",
+    re.I,
+)
+
+
+def strip_opening_praise(text):
+    t = str(text or "")
+    m = OPENING_PRAISE_RE.match(t)
+    if not m:
+        return t
+    rest = t[m.end():].lstrip()
+    return rest[:1].upper() + rest[1:] if rest else ""
+
+
+def note_is_clean(note):
+    n = str(note or "")
+    if len(n.split()) >= 15:
+        return False
+    return not _phrase_hits(
+        n.lower(), BANNED_PHRASES + AMEND_BANNED + SESSION_NARRATION + CHARACTERISING,
+        praise=True)
+
+# Bare "great" is gone: it rejected "flashcards are great for recall". The
+# praise shapes of it are listed, and STANDALONE_PRAISE_RE catches "Great."
 AMEND_BANNED = [
-    "do not worry", "great", "good progress", "nice work",
+    "do not worry", "good progress", "nice work",
     "well done", "great job", "good job", "nicely done", "you're doing",
     "you are doing", "keep it up", "almost there", "hang in there",
+    "great work", "great progress", "great start", "that's great",
+    "that is great", "that's awesome", "love that", "proud of you",
+    "good for you",
     "that's ok", "that is ok", "no problem", "happens to everyone",
-    "an hour", "so far you", "you've been", "you have been",
+    "an hour", "so far you", "so far, you", "you've been", "you have been",
     "took a while", "finally", "at last",
 ]
 
-# Standalone "good" at the start is praise ("Good. Now ..."), but "good" inside
-# substantive content ("use a good method") is not. Keep this narrower than
-# adding bare "good" to AMEND_BANNED.
+# Ordinary advice words. In an action or a plan they are exhortation ("try to
+# start"), and decompose bans them there. In a chat reply they are how people
+# give advice ("you should do probability before ML").
+RESPONSE_OK = {"you should", "try to"}
+RESPONSE_BANNED = [p for p in BANNED_PHRASES if p not in RESPONSE_OK] + AMEND_BANNED
+
+# A praise word opening a sentence ("Good. Now ...", "Great, open it",
+# "Nice one", "Good catch", "Good call on ..."). Inside a sentence it
+# describes the work and is allowed ("flashcards are great for recall").
 STANDALONE_PRAISE_RE = re.compile(
-    r"^(?:good)(?:\s*[,!.:\-]|\s+(?:now|so|let's|let us)\b)",
+    r"^(good|great|nice|awesome|perfect|excellent|amazing|brilliant|lovely|"
+    r"fantastic|wonderful)"
+    r"(?:\s+(?:catch|call|find|question|point|thinking|idea|work|job|start|one|"
+    r"stuff|progress|move|spot|instinct|going|effort)\b"
+    r"|(?:\s+[a-z']+)?\s*(?:[.!,;:]|[-–—]|$)"
+    r"|\s+(?:now|so|let's|let us)\b)",
     re.I,
 )
 
@@ -594,13 +807,15 @@ def validate_session(out, context="", session=None):
     fa = out.get("first_action")
     plans = out.get("plans") or []
     ri = out.get("revised_intent")
-    note = out.get("note", "")
     resp = str(out.get("response") or "").strip()
     q = out.get("question")          # deprecated, still grounded if present
 
     add("response is a non-empty string", bool(resp))
     if resp:
-        add("response under 50 words", len(resp.split()) <= 50,
+        # 50 cut explanations off mid-thought. The prompt asks for one to
+        # three sentences, about 60 words when explaining; this leaves slack.
+        add(f"response under {RESPONSE_MAX_WORDS} words",
+            len(resp.split()) <= RESPONSE_MAX_WORDS,
             f"{len(resp.split())} words")
         add("response asks at most one question", resp.count("?") <= 1,
             f"{resp.count('?')} question marks")
@@ -628,41 +843,53 @@ def validate_session(out, context="", session=None):
         add("revised_intent under 15 words", len(str(ri).split()) < 15,
             f"{len(str(ri).split())} words")
 
-    add("note under 15 words", len(str(note).split()) < 15,
-        f"{len(str(note).split())} words")
+    # No rule reads `note`. It is internal: never shown to the user, never
+    # shown to the model again. Checking it threw away good replies because
+    # of a word in a record nobody reads. SessionOutput._tidy keeps it clean.
 
     if any(not ok for _, ok, _ in checks):
         return False, checks
 
-    # Banned language, across everything the user can see.
-    for label, txt in (("response", resp), ("note", note)):
-        hits = _phrase_hits(str(txt).lower(), BANNED_PHRASES + AMEND_BANNED)
-        add(f"{label} has no praise, reassurance or time-accounting",
-            not hits, ", ".join(hits[:3]))
+    # Banned language, in everything the user reads.
+    hits = _phrase_hits(resp.lower(), RESPONSE_BANNED, praise=True)
+    add("response has no praise, reassurance or time-accounting",
+        not hits, ", ".join(hits[:3]))
+
+    hits = _phrase_hits(resp.lower(), CHARACTERISING)
+    add("response talks about the work, not the person", not hits,
+        ", ".join(hits[:3]))
+
+    hits = _phrase_hits(resp.lower(), CONDITIONAL_HELP)
+    add("response offers a way forward, not a condition", not hits,
+        ", ".join(hits[:3]))
 
     # Grounding. The response can assert an artifact into existence just as
-    # easily as an action can, so it gets the artifact check too. note,
-    # revised_intent and the deprecated question do not: they describe
-    # rather than send anyone anywhere.
-    for rule, bad in grounding_checks(resp, context):
+    # easily as an action can, so its instructions get the artifact check
+    # too (see response_grounding_checks). revised_intent and the deprecated
+    # question do not: they describe rather than send anyone anywhere.
+    for rule, bad in response_grounding_checks(resp, context):
         add(f"response: {rule}", not bad, ", ".join(bad[:3]))
-    for label, txt in (("note", note), ("revised_intent", ri), ("question", q)):
+    for label, txt in (("revised_intent", ri), ("question", q)):
         for rule, bad in grounding_checks(str(txt or ""), context,
                                           include_artifacts=False):
             add(f"{label}: {rule}", not bad, ", ".join(bad[:3]))
 
-    all_text = " | ".join(
-        [resp, str(note), str(fa or ""), str(ri or "")] +
-        [str(p.get("if", "")) + " " + str(p.get("then", "")) for p in plans]
-    ).lower()
-    hits = _phrase_hits(all_text, SESSION_NARRATION)
+    # Narration is about how the reply talks to them, so it reads the reply
+    # only. On the plans it rejected a real trigger, "if I'm still stuck
+    # after five minutes".
+    hits = _phrase_hits(resp.lower(), SESSION_NARRATION)
+    said_by_them = re.sub(r"\s+", " ", (context or "").lower())
+    hits = [h for h in hits if not (h in NARRATION_ECHO_OK and h in said_by_them)]
     add("does not narrate the session back at them", not hits, ", ".join(hits[:3]))
 
     # Hand the action+plans to decompose's validator, which already covers
     # physical verbs, vague triggers, banned phrases and grounding. Skip the
-    # 2-4 plan rule, which does not apply here.
+    # 2-4 plan rule, which does not apply here. Quoted words to type are
+    # taken out first (see QUOTED_RE); secrets are checked on the raw text.
     if kind != "done" and fa:
-        shaped = {"first_action": fa, "plans": plans}
+        shaped = {"first_action": _unquote(fa),
+                  "plans": [{"if": _unquote(p["if"]), "then": _unquote(p["then"])}
+                            for p in plans]}
         ok2, checks2 = validate(shaped, context,
                                 mode="fallback" if not plans else "normal")
         for rule, ok, detail, _sev in checks2:
@@ -670,13 +897,16 @@ def validate_session(out, context="", session=None):
                 continue
             checks.append((rule, ok, detail))
 
-        blob = " | ".join([fa] + [p["if"] + " | " + p["then"] for p in plans]).lower()
-        hits = _phrase_hits(blob, AMEND_BANNED)
+        raw = " | ".join([fa] + [p["if"] + " | " + p["then"] for p in plans])
+        secrets = secret_exposure_hits(raw)
+        add("no secret exposure in quoted text", not secrets, ", ".join(secrets[:2]))
+
+        hits = _phrase_hits(_unquote(raw).lower(), AMEND_BANNED)
         add("action and plans free of praise or time-accounting",
             not hits, ", ".join(hits[:3]))
 
         ablob = " ".join([str(fa)] + [p["if"] + " " + p["then"] for p in plans])
-        for rule, bad in grounding_checks(ablob, context):
+        for rule, bad in grounding_checks(ablob, context, quoted_ok=True):
             add(rule, not bad, ", ".join(bad[:3]))
 
         seq = check_sequential(fa, [{"if": p["if"], "then": p["then"]}
@@ -831,6 +1061,9 @@ def run_lifecycle(name, spec, args):
             break
 
         print(f"  kind : {out.get('kind')}")
+        # What the user actually reads, after clean-up and any repair. The
+        # JSON printed above is the model's raw stream, before either.
+        print(f"  says : {out.get('response')}")
         if out.get("question"):
             print(f"  ASKS : {out['question']}")
         else:
@@ -980,10 +1213,13 @@ def amend_fallback(session, message, context=""):
     concrete resource the user actually named, or a resource-neutral step.
     Never introduce a generic "file" as though one were known to exist.
     """
+    # These lines reach the chat when the model fails twice, so they should
+    # sound like the chat, not like a system message.
     prev = str(session.get("first_action") or "").strip()
     if prev:
         cand = {"kind": "continue", "first_action": prev, "question": None,
-                "response": "Nothing has moved yet, so the step is the same.",
+                "response": "Let's stay with this step for now. If something's "
+                            "in the way, tell me what it is.",
                 "revised_intent": None, "plans": [], "note": "Same step, unchanged.",
                 "_fallback": True}
         if validate_amend(cand, context, session)[0]:
@@ -1005,7 +1241,8 @@ def amend_fallback(session, message, context=""):
             fa = "Open whatever you are working in and type one word"
 
     cand = {"kind": "continue", "first_action": fa, "question": None,
-            "response": "Start from the work already in front of you.",
+            "response": "Let's pick it up from whatever's in front of you, "
+                        "and tell me where it gets stuck.",
             "revised_intent": None, "plans": [], "note": "Back to the current work.",
             "_fallback": True}
     if validate_amend(cand, context, session)[0]:
@@ -1013,7 +1250,8 @@ def amend_fallback(session, message, context=""):
 
     # Last-resort resource-neutral action, still subject to the same guardrail.
     return {"kind": "continue", "first_action": "Type one word describing what you need next",
-            "question": None, "response": "State the next thing you need to move forward.",
+            "question": None, "response": "Tell me what you need next and we'll "
+                                          "take it from there.",
             "revised_intent": None, "plans": [], "note": "Need a concrete next step.",
             "_fallback": True}
 
@@ -1049,7 +1287,9 @@ def do_session(session, message, args):
     if session.get("done"):
         raise SessionClosed(
             "this session is finished - start a new one rather than reopening it")
-    agent = build_agent("decompose", SESSION_PROMPT,
+    # "amend", like the Lambda: that role has the chat's temperature, so the
+    # harness tests the replies users actually get.
+    agent = build_agent("amend", SESSION_PROMPT,
                         model_id=args.model, region=args.region, max_tokens=500)
     context = user_context(session, message)
     user = build_session_user(session, message)
@@ -1193,9 +1433,9 @@ SELFTESTS = [
 
     ("session: a lecture is rejected on length",
      lambda: validate_session(
-         _out(response=" ".join(["random variables matter here"] * 15)),
+         _out(response=" ".join(["random variables matter here"] * 20)),
          user_context(NAMED, "what topics"), NAMED),
-     False, "response under 50 words"),
+     False, "response under 70 words"),
 
     ("session: two questions in one response is rejected",
      lambda: validate_session(
@@ -1402,6 +1642,139 @@ SELFTESTS = [
     ("session: ensure_action leaves a finished session alone",
      lambda: (lambda o: (o.get("first_action") is None, []))(
          ensure_action({"kind": "done", "first_action": None}, NAMED)),
+     True, None),
+
+    # --- the chat can talk like a person; the hard lines still hold ---
+    ("session: explaining with everyday words passes",
+     lambda: validate_session(
+         _out(response="PCA finds the directions where the data varies most and "
+                       "keeps only those. The top eigenvectors of the covariance "
+                       "matrix are those directions, and the syllabus leans on it."),
+         user_context(NAMED, "i dont get PCA"), NAMED),
+     True, None),
+
+    ("session: ordinary advice words pass in a reply",
+     lambda: validate_session(
+         _out(response="Probability next. You should get through both before ML, "
+                       "and try to recall each definition before you check it."),
+         user_context(NAMED, "what after linear algebra"), NAMED),
+     True, None),
+
+    ("session: 'great' describing the work passes",
+     lambda: validate_session(
+         _out(response="For formulas, yes. Flashcards are great for recall, less "
+                       "so for problem-solving."),
+         user_context(NAMED, "should i make flashcards"), NAMED),
+     True, None),
+
+    ("session: echoing their own 'still stuck' passes",
+     lambda: validate_session(
+         _out(response="If you're still stuck, paste the one line that loses you "
+                       "and we'll untangle just that."),
+         user_context(NAMED, "still stuck on the proof"), NAMED),
+     True, None),
+
+    ("session: a library call in an explanation passes",
+     lambda: validate_session(
+         _out(response="Call df.head() to see the first rows, e.g. to spot "
+                       "missing values."),
+         user_context(NAMED, "how do i look at a dataframe"), NAMED),
+     True, None),
+
+    ("session: praise opening a sentence is rejected",
+     lambda: validate_session(
+         _out(response="Read it once more. Nice, now the next heading."),
+         user_context(NAMED, "read it"), NAMED),
+     False, "response has no praise, reassurance or time-accounting"),
+
+    ("session: describing the person is rejected",
+     lambda: validate_session(
+         _out(response="You seem tired, so keep the next part small."),
+         user_context(NAMED, "ugh"), NAMED),
+     False, "response talks about the work, not the person"),
+
+    ("session: every form of a banned stem is caught",
+     lambda: validate_session(
+         _out(response="Procrastinating on proofs is common. Read one line."),
+         user_context(NAMED, "cant start"), NAMED),
+     False, "response has no praise, reassurance or time-accounting"),
+
+    ("session: an invented file before a question is still caught",
+     lambda: validate_session(
+         _out(response="Open utils.py first. Which line fails?"),
+         user_context(NAMED, "it errors"), NAMED),
+     False, "response: no invented filenames"),
+
+    ("session: an instruction to an unmentioned artifact is still rejected",
+     lambda: validate_session(
+         _out(response="Open the syllabus and read the ML part first.",
+              first_action="Open whatever you are working in and type one word"),
+         user_context({"declared_intent": "study for gate da", "notes": "",
+                       "history": []}, "what first"),
+         {"declared_intent": "study for gate da", "notes": "", "history": []}),
+     False, "response: no artifact they never mentioned"),
+
+    # --- found in the first live lifecycle run ---
+    ("session: an opening 'Good catch.' is removed, not rejected",
+     lambda: (lambda o: (o["response"].startswith("If the middleware")
+                         and validate_session(o, user_context(NAMED, "it's the middleware"),
+                                              NAMED)[0], []))(
+         SessionOutput(kind="continue",
+                       response="Good catch. If the middleware rejects the token "
+                                "first, the fix belongs there.",
+                       first_action="Open LA.pdf and read the first heading",
+                       plans=[], note="Moved.").model_dump(by_alias=True)),
+     True, None),
+
+    ("session: praise that can't be removed cleanly is still rejected",
+     lambda: validate_session(
+         SessionOutput(kind="continue",
+                       response="Good call on checking the middleware. Run the test.",
+                       first_action="Open LA.pdf and read the first heading",
+                       plans=[], note="Moved.").model_dump(by_alias=True),
+         user_context(NAMED, "checked it"), NAMED),
+     False, "response has no praise, reassurance or time-accounting"),
+
+    ("session: the internal note never costs a good reply",
+     lambda: (lambda o: (o["note"] == "Turn recorded."
+                         and validate_session(o, user_context(NAMED, "still cant start"),
+                                              NAMED)[0], []))(
+         SessionOutput(kind="continue",
+                       response="Type anything at all, even a placeholder, just to "
+                                "get words on the page.",
+                       first_action="Type one sentence into LA.pdf's notes margin",
+                       plans=[], note="Still stuck on the first sentence for an hour."
+                       ).model_dump(by_alias=True)),
+     True, None),
+
+    ("session: help that waits on them is rejected",
+     lambda: validate_session(
+         _out(response="Without the error message, I can't help you fix it. "
+                       "Paste it here or look at it yourself."),
+         user_context(NAMED, "nope"), NAMED),
+     False, "response offers a way forward, not a condition"),
+
+    ("session: words to type, in quotes, are not claims about their material",
+     lambda: validate_session(
+         _out(response="Put any words down, even a stand-in first line.",
+              first_action="Type 'This report summarizes Q3 results' in the Google Doc"),
+         user_context({"declared_intent": "write the Q3 summary report",
+                       "notes": "Google Doc, due Friday.", "history": []}, "cant start"),
+         {"declared_intent": "write the Q3 summary report",
+          "notes": "Google Doc, due Friday.", "history": []}),
+     True, None),
+
+    ("session: a filename in quotes is still checked",
+     lambda: validate_session(
+         _out(first_action="Open 'utils.py' and read the top"),
+         user_context(NAMED, "what now"), NAMED),
+     False, "no invented filenames"),
+
+    ("session: 'still stuck' as a plan trigger is a real situation",
+     lambda: validate_session(
+         _out(plans=[{"if": "I'm still stuck after five minutes",
+                      "then": "paste the exact error into the chat"}]),
+         user_context(NAMED, "ok"), NAMED),
      True, None),
 
     ("initiate: opening action naming an unmentioned PDF is rejected",

@@ -1,13 +1,3 @@
-"""Shared production guardrail for the decomposition agent.
-
-The throwaway decompose probe remains useful for experiments, but the production
-Strands path imports its prompts, validator, fallback and cases from this module.
-That prevents the model-calling layer from drifting away from the safety checks.
-
-Run:
-    python decompose_guardrail.py --selftest
-"""
-
 import argparse
 import re
 

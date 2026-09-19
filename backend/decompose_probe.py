@@ -1,22 +1,3 @@
-"""
-THROWAWAY PROBE SCRIPT - do NOT commit to the hackathon repo.
-Practice work only. The real project starts Sept 17.
-
-THE QUESTION THIS ANSWERS:
-    Can the model reliably turn a stated goal into (a) ONE physical first
-    action and (b) contingent if-then plans - without sliding into a
-    to-do list?
-
-Unlike re-entry, this output is machine-checkable. So the validator below
-is not just a test: it is the shippable guardrail. Ship it as-is.
-
-Usage:
-    python decompose_probe.py --all --provider deepinfra
-    python decompose_probe.py --case aversive
-    python decompose_probe.py --goal "your own goal here"
-    python decompose_probe.py --case vague --dry-run
-"""
-
 import argparse
 import json
 import os
