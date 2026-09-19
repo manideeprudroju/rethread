@@ -161,13 +161,12 @@ if (typeof window !== "undefined") {
     }
 
     const newEvent = {
-      ts:
-        payload.ts ||
-        new Date().toISOString(),
-
+      ts: payload.ts || new Date().toISOString(),
       title: payload.title,
-
       domain: payload.domain,
+      is_local_dev:
+        payload.domain === "localhost" ||
+        payload.domain === "127.0.0.1",
     };
 
     state.events.push(newEvent);
@@ -322,6 +321,7 @@ export function getEventsPayload() {
       title: event.title || "",
       domain: event.domain || "",
       dwell_seconds: dwellSeconds,
+      is_local_dev: event.is_local_dev || false,
     };
   });
 }
