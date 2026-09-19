@@ -324,14 +324,15 @@ export default function IntentPanel({ onStarted }) {
         />
 
         {/* 3. DUE DATE */}
-        <label style={labelStyle}>When is it due?</label>
+        <label style={labelStyle}>When do you want to have it done?</label>
 
-        <input
-          type="date"
+        <textarea
           value={dueDate}
           onChange={(e) => setDueDate(e.target.value)}
+          placeholder="e.g. Want to finish before I start practicing tonight"
+          rows={2}
           style={{
-            ...inputStyle,
+            ...textareaStyle,
             marginBottom: 20,
           }}
         />
