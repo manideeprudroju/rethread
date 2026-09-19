@@ -95,7 +95,9 @@ export default function AmendChat({ onDone }) {
   const [messages, setMessages] = useState([
     {
       role: "assistant",
-      text: `You're working on: ${session.declared_intent || "your current task"}.\n\nCurrent next move: ${session.first_action || "Tell me what is happening."}`,
+      text: `You're working on: ${
+        session.declared_intent || "your current task"
+      }. What’s happening?`,
     },
   ]);
   const [message, setMessage] = useState("");
@@ -135,11 +137,12 @@ export default function AmendChat({ onDone }) {
         plans: result.plans,
       });
 
-      const response = result.note
-        ? `${result.note}\n\nNext move: ${result.first_action}`
-        : `Next move: ${result.first_action}`;
+      const response = result.note || "";
 
-      setMessages((prev) => [...prev, { role: "assistant", text: response }]);
+      setMessages((prev) => [
+        ...prev,
+        { role: "assistant", text: response },
+      ]);
       setState("idle");
     } catch (err) {
       console.error("Amend failed:", err);
