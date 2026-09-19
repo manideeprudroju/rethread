@@ -2,6 +2,7 @@ import { useState } from "react";
 import { ArrowRight, RotateCcw, ChevronDown, ChevronUp } from "lucide-react";
 import { decompose, assignArm } from "./api";
 import { createSession, beginTimer } from "./sessionStore";
+import { EXPERIMENT_ARMS, PLANS_OPEN_ARM } from "./experiment";
 
 const cardStyle = {
   fontFamily: "'Inter', system-ui, sans-serif",
@@ -78,6 +79,13 @@ export default function IntentPanel({ onStarted }) {
   const [result, setResult] = useState(null);
   const [showPlans, setShowPlans] = useState(false);
 
+  // Experiment arm for this session, from the server. null = not in the
+  // experiment this time (assign failed); the session still works normally
+  // and simply isn't counted. There is deliberately no local fallback: a
+  // guessed arm (e.g. alternating) would line the arms up with the person's
+  // routine, which the gate cannot tell apart from a real effect.
+  const [condition, setCondition] = useState(null);
+
   async function handleSubmit(e) {
     e.preventDefault();
 
@@ -88,16 +96,33 @@ export default function IntentPanel({ onStarted }) {
     try {
       const answers = [
         location.trim() ? `Location: ${location.trim()}` : "",
-        dueDate ? `Due date: ${dueDate}` : "",
+        dueDate.trim() ? `Due date: ${dueDate.trim()}` : "",
       ]
         .filter(Boolean)
         .join("\n");
 
-      const res = await decompose({
-        goal: goal.trim(),
-        answers,
-      });
+      // Assign in parallel with decompose. The arm decides how the preview
+      // below looks (plans open or collapsed), so it has to be known before
+      // the preview renders. It also keeps "Start working" instant: no
+      // network call on that click, so a double click can't start twice.
+      // The server picks the arm (balanced shuffled blocks, seeded by the
+      // user's Cognito id) and counts their sessions itself.
+      const [res, arm] = await Promise.all([
+        decompose({
+          goal: goal.trim(),
+          answers,
+        }),
+        assignArm({ arms: EXPERIMENT_ARMS }).catch((err) => {
+          console.error("Assign failed, session runs outside the experiment:", err);
+          return null;
+        }),
+      ]);
 
+      const cond = arm?.condition ?? null;
+      setCondition(cond);
+      // The experiment's one manipulation: step_and_plans shows the if-then
+      // plans open; first_step_only leaves them one click away.
+      setShowPlans(cond === PLANS_OPEN_ARM);
       setResult(res);
       setState("preview");
     } catch (err) {
@@ -106,36 +131,13 @@ export default function IntentPanel({ onStarted }) {
     }
   }
 
-  async function handleStart() {
-    const sessionIndex = Number(
-      localStorage.getItem("rethread_session_count_v1") || "0"
-    );
-
-    let condition = sessionIndex % 2 === 0 ? "one_step" : "three_steps";
-
-    try {
-      const assigned = await assignArm({
-        arms: ["one_step", "three_steps"],
-        session_index: sessionIndex,
-      });
-
-      condition = assigned?.condition || condition;
-    } catch (err) {
-      console.error(
-        "Assignment failed; using deterministic local assignment:",
-        err
-      );
-    }
-
-    localStorage.setItem(
-      "rethread_session_count_v1",
-      String(sessionIndex + 1)
-    );
-
+  function handleStart() {
     createSession({
       goal: goal.trim(),
+      // The store puts these into the backend session's notes, so the chat
+      // can refer to where the work lives.
       location: location.trim(),
-      dueDate: dueDate,
+      dueDate: dueDate.trim(),
       firstAction: result.first_action,
       plans: result.plans,
       condition,
