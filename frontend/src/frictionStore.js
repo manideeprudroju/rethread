@@ -52,8 +52,20 @@ let running = null; // in-flight nightly promise, so two panels share one call
 let runningFor = null; // ...and whose data it is for
 
 function empty() {
-  return { v: 1, lastRunDay: null, lastRunAt: null, result: null,
+  return { v: 1, lastRunDay: null, lastRunAt: null, lastRunSig: null, result: null,
            pendingPlan: null, trials: [], vetoes: {}, feedback: [] };
+}
+
+/*
+ * What a check was run on. "Once a day" alone was wrong: the check reads
+ * sessions after they end, so a session that ended AFTER today's check was
+ * not looked at until the next day, and the panel kept showing the older
+ * answer. Same day plus the same archive means the answer cannot have
+ * changed; anything new re-runs it.
+ */
+function archiveSig(data) {
+  const last = data.events[data.events.length - 1];
+  return `${data.sessions.length}|${data.events.length}|${last ? last.ts : ""}`;
 }
 
 function read(user) {
@@ -227,15 +239,16 @@ export async function runNightly({ force = false, demo = false } = {}) {
   const user = sync();
   if (!user) return null;
 
-  if (!force && !demo && state.lastRunDay === today()) {
+  const data = demo ? buildDemoData() : archive();
+  const sig = demo ? null : archiveSig(data);
+
+  if (!force && !demo && state.lastRunDay === today() && state.lastRunSig === sig) {
     demoResult = null;
     // The panel may have drawn before this user's data was loaded.
     emit();
     return state.result;
   }
   if (running && runningFor === user) return running;
-
-  const data = demo ? buildDemoData() : archive();
 
   const mine = (async () => {
     try {
@@ -254,6 +267,7 @@ export async function runNightly({ force = false, demo = false } = {}) {
       state.lastRunAt = Date.now();
       mergeTrialValues(result?.trial_values);
       state.lastRunDay = today();
+      state.lastRunSig = sig;
       // A new plan replaces a pending one that no session picked up.
       state.pendingPlan = result?.plan ? { ...result.plan, createdAt: Date.now() } : null;
       return state.result;

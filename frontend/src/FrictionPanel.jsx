@@ -70,6 +70,15 @@ export default function FrictionPanel({ demo = false }) {
     load(demo);
   }, [load, demo]);
 
+  // A session just ended, so its tabs are in the archive now: look again.
+  // Without this the panel kept yesterday's answer until the next day, which
+  // reads as "the check stopped working".
+  const wasLive = useRef(session.hasSession);
+  useEffect(() => {
+    if (!demo && wasLive.current && !session.hasSession) load(true);
+    wasLive.current = session.hasSession;
+  }, [session.hasSession, demo, load]);
+
   const result = fx.result;
   const plan = result?.plan || null;
   const pending = fx.pendingPlan;
@@ -144,7 +153,11 @@ export default function FrictionPanel({ demo = false }) {
             </ul>
           ) : (
             <p className="fx-empty">
-              {result ? "Nothing recurring. Patterns show up here once they repeat." : "Nothing checked yet."}
+              {!result
+                ? "Nothing checked yet."
+                : result.window?.sessions
+                  ? "Nothing recurring. Patterns show up here once they repeat."
+                  : "No finished sessions in the last few days yet. A session is read once it ends."}
             </p>
           )}
         </div>
@@ -274,13 +287,24 @@ function PlanHero({ phase, result, plan, pending, session, vetoes, onRetry, onAn
   }
 
   if (!plan) {
+    // Nothing to look at and nothing recurring are different answers, and
+    // saying so is the difference between "still gathering" and "broken".
+    const noSessions = !!result && !result.window?.sessions;
     return (
       <div className="fx-reveal" style={{ display: "contents" }}>
         <p className="fx-eyebrow">Tomorrow's plan</p>
         <p className="fx-then">
-          {result?.status === "all_set_aside" ? "You've set aside every support for this." : "Nothing recurring in your last few sessions"}
+          {result?.status === "all_set_aside"
+            ? "You've set aside every support for this."
+            : noSessions
+              ? "Nothing to look at yet"
+              : "Nothing recurring in your last few sessions"}
         </p>
-        <p className="fx-sub">Your next session runs without an extra plan.</p>
+        <p className="fx-sub">
+          {noSessions
+            ? "This reads a session once it ends. Finish one and it gets looked at."
+            : "Your next session runs without an extra plan."}
+        </p>
       </div>
     );
   }

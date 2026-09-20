@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { ArrowRight } from "lucide-react";
-import { getSnapshot, subscribe } from "./sessionStore";
+import { endSession, getSnapshot, subscribe } from "./sessionStore";
 import { nightly } from "./api";
 import { EXPERIMENT_ARMS, METRIC_LABEL } from "./experiment";
 
@@ -95,13 +95,67 @@ function LearningCard() {
   );
 }
 
+const endLinkStyle = {
+  display: "block",
+  margin: "12px auto 0",
+  padding: "4px 2px",
+  background: "none",
+  border: "none",
+  fontFamily: "inherit",
+  fontSize: 13,
+  color: "#8A8578",
+  cursor: "pointer",
+};
+
+const endRowStyle = {
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "center",
+  flexWrap: "wrap",
+  gap: 10,
+  marginTop: 12,
+};
+
+const endAskStyle = {
+  fontSize: 13,
+  color: "#5C5A4E",
+};
+
+const endConfirmStyle = {
+  fontFamily: "inherit",
+  fontSize: 13,
+  padding: "6px 12px",
+  borderRadius: 9,
+  border: "1px solid #A9A493",
+  background: "#F7F5EE",
+  color: "#1E2A28",
+  cursor: "pointer",
+};
+
+const endQuietStyle = {
+  fontFamily: "inherit",
+  fontSize: 13,
+  padding: "6px 4px",
+  background: "none",
+  border: "none",
+  color: "#8A8578",
+  cursor: "pointer",
+};
+
 export default function Dashboard({ onContinue, onStartNew }) {
   const [snap, setSnap] = useState(getSnapshot());
+  // Two taps to end, so a stray click can't close a live session.
+  const [confirmEnd, setConfirmEnd] = useState(false);
 
   useEffect(() => {
     setSnap(getSnapshot());
     return subscribe(setSnap);
   }, []);
+
+  // A new session is a clean slate for this control.
+  useEffect(() => {
+    setConfirmEnd(false);
+  }, [snap.sessionStartedAt]);
 
   // A finished session has nothing to continue: offer a new one instead of
   // a "Continue" card with an empty first move. Starting it archives and
@@ -160,6 +214,32 @@ export default function Dashboard({ onContinue, onStartNew }) {
             <span>Continue session</span>
             <ArrowRight size={18} />
           </button>
+
+          {/* Ending a session here records it as stopped. Finishing the work
+              is what you say in the chat, and that is what marks it done:
+              one control, one meaning. Neutral wording either way -- a
+              session that ends early is a data point, not a failure. */}
+          {confirmEnd ? (
+            <div style={endRowStyle}>
+              <span style={endAskStyle}>End this session?</span>
+              <button
+                onClick={() => {
+                  endSession("stopped");
+                  setConfirmEnd(false);
+                }}
+                style={endConfirmStyle}
+              >
+                End it
+              </button>
+              <button onClick={() => setConfirmEnd(false)} style={endQuietStyle}>
+                Keep going
+              </button>
+            </div>
+          ) : (
+            <button onClick={() => setConfirmEnd(true)} style={endLinkStyle}>
+              End session
+            </button>
+          )}
         </>
       ) : (
         <>
