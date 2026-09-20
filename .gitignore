@@ -5,3 +5,16 @@ dist/
 .env.*.local
 *.log
 .DS_Store
+
+# backend build artifacts
+deployment.zip
+package/
+__pycache__/
+*.pyc
+
+# local secrets and test output
+.env
+.env.local
+smoke.json
+out.json
+checks.log
