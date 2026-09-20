@@ -2,7 +2,7 @@
 
 **Getting back into the work after an interruption: an n-of-1 support tool for ADHD executive function, built on AWS**
 
-**Team:** Anirban Biswas (agents, backend) · Manideep Rudroju (UI, deployment)  
+**Team:** Anirban Biswas (agents, backend) · Manideep Rudroju (UI, deployment), Nenavath Rathan(UI/UX)
 **Track:** Ship It · **Live:** <https://main.d16k496u63q21s.amplifyapp.com> · **Code:** <https://github.com/manideeprudroju/rethread>
 
 ---
