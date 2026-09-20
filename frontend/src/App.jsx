@@ -120,8 +120,11 @@ export default function App() {
       style={{
         fontFamily: "'Inter', system-ui, sans-serif",
         background: "#E4E1D7",
+        width: "100%",
         minHeight: "100vh",
+        margin: 0,
         padding: 40,
+        boxSizing: "border-box",
         display: "flex",
         flexDirection: "column",
         alignItems: "center",
