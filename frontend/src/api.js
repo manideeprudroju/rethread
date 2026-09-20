@@ -189,3 +189,35 @@ export async function logSession(record) {
 export async function nightly({ arms, metric_label } = {}) {
   return callAgent("nightly", { arms, metric_label });
 }
+
+// ---------------------------------------------------------------------------
+// friction / heavy / guide — the Friction panel. Per-user on the server like
+// the three above: the Cognito id seeds the support experiment's arm order.
+// ---------------------------------------------------------------------------
+
+// friction — the nightly support check. frictionStore.js calls it on the
+// first dashboard open of the day. Response:
+//   status   "plan" | "nothing_found" | "all_set_aside"
+//   patterns what showed up, each with last_seen and before/during/after.
+//            episodes / days_seen rank the patterns; never render them.
+//   plan     one if-then plan for the next session. _fallback:true is the
+//            honest template version and renders like any other plan.
+//   trial_values  outcomes to store (frictionStore does this)
+export async function friction(payload) {
+  return callAgent("friction", payload);
+}
+
+// heavy — the user tapped "this one feels heavy". User-stated, never
+// inferred. Returns { status, plan, care_line }.
+export async function heavy(payload) {
+  return callAgent("heavy", payload);
+}
+
+// guide — the chat in the Friction panel. Send { message, history } where
+// history is the last few turns as [{ role: "user"|"assistant", text }].
+// Response: { reply, sources: [{ id, title, org, url }], kind, care_line }.
+// kind is "answer", "fallback", or a fixed safety reply: "crisis",
+// "medication", "self_assessment". All of them render as a normal reply.
+export async function guide({ message, history = [] }) {
+  return callAgent("guide", { message, history });
+}

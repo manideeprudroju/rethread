@@ -6,6 +6,9 @@ import IntentPanel from "./IntentPanel";
 import LiveBadge from "./LiveBadge";
 import ReentryPanel from "./ReentryPanel";
 import AmendChat from "./AmendChat";
+import FrictionPanel from "./FrictionPanel";
+import NightlySummaryPanel from "./NightlySummaryPanel";
+import { attachPendingPlan } from "./frictionStore";
 import { bindUser } from "./sessionStore";
 // DriftPopup intentionally not mounted — on hold, see team discussion.
 // It's still built (./DriftPopup.jsx) and ready to re-enable, but it
@@ -132,10 +135,31 @@ export default function App() {
       }}
     >
       {view === "dashboard" && (
-        <Dashboard
-          onContinue={() => setView("session_return")}
-          onStartNew={() => setView("intent")}
-        />
+        <>
+          <Dashboard
+            onContinue={() => setView("session_return")}
+            onStartNew={() => setView("intent")}
+            onNightly={() => setView("nightly")}
+          />
+
+          <button
+            onClick={() => setView("nightly")}
+            style={nightlyButtonStyle}
+          >
+            Nightly summary →
+          </button>
+
+          {/* Nightly friction check. ?demo=1 shows the sample week (for the
+              video) and never writes to real data. Sign in first, then add
+              ?demo=1 and reload: the sign-in redirect drops the query. */}
+          <FrictionPanel
+            demo={new URLSearchParams(window.location.search).has("demo")}
+          />
+        </>
+      )}
+
+      {view === "nightly" && (
+        <NightlySummaryPanel onBack={() => setView("dashboard")} />
       )}
 
       {view === "intent" && (
@@ -148,7 +172,12 @@ export default function App() {
           </button>
 
           <IntentPanel
-            onStarted={() => setView("session_fresh")}
+            onStarted={() => {
+              // Tomorrow's friction plan joins the session that just started
+              // (both experiment arms alike; see frictionStore.js).
+              attachPendingPlan();
+              setView("session_fresh");
+            }}
           />
         </>
       )}
@@ -299,6 +328,17 @@ const primaryButtonStyle = {
   color: "#FFFFFF",
   cursor: "pointer",
   boxSizing: "border-box",
+};
+
+const nightlyButtonStyle = {
+  fontFamily: "inherit",
+  fontSize: 13,
+  padding: "8px 14px",
+  borderRadius: 8,
+  border: "1px solid #A9A493",
+  background: "#F7F5EE",
+  color: "#3F5D54",
+  cursor: "pointer",
 };
 
 const backButtonStyle = {

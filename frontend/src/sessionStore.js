@@ -44,6 +44,13 @@ const ACTIVITY_HISTORY_KEY =
 const NIGHTLY_SESSIONS_KEY =
   "rethread_nightly_sessions_v1";
 
+// Every finished session, experiment or not, for the friction check.
+// Separate from NIGHTLY_SESSIONS_KEY on purpose: that key feeds the main
+// experiment, and only sessions with an experiment condition belong in it.
+// Per user like every other key here (userKey adds the Cognito id).
+const SESSION_LOG_KEY =
+  "rethread_session_log_v1";
+
 // The live session, so a reload or a crash doesn't lose it.
 const ACTIVE_SESSION_KEY =
   "rethread_active_session_v1";
@@ -88,6 +95,12 @@ export function bindUser(sub) {
   clearSessionState();
   restoreActiveSession();
   notify();
+}
+
+// The Cognito id bindUser() was given, or null. frictionStore.js keys its
+// own data with it, so friction plans and trials are per user too.
+export function getBoundUser() {
+  return currentUser;
 }
 
 /* =====================================================
@@ -432,6 +445,11 @@ function listenOnce(target, type, handler) {
  * One path for every captured event, from the extension or from addEvent().
  */
 function recordEvent(event) {
+  // The dashboard itself is not activity (see isOwnAppTab). Dropped here,
+  // before it is stored, so it never reaches the initiation check, churn,
+  // the re-entry trail or the archive the friction check reads.
+  if (isOwnAppTab(event)) return;
+
   state.events.push(event);
 
   checkInitiation(event);
@@ -481,8 +499,37 @@ function initiationChecks() {
   return Object.keys(state.initiationChecked).length + initiationPending.size;
 }
 
+/*
+ * A tab of this dashboard. The extension already skips the app's own pages,
+ * but only the URLs listed in its manifest.json, so the dashboard on another
+ * port (or on the deployed URL, if it isn't listed there) still came through
+ * and was judged like any other tab. The page knows its own host, so it
+ * checks too: the same host as this page is the dashboard, wherever it is
+ * served. Locally, localhost and 127.0.0.1 both count. On the deployed site
+ * a localhost tab is someone's own work and is kept.
+ */
+const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1"]);
+
+export function isOwnAppTab(event) {
+  const domain = String(event?.domain || "")
+    .trim()
+    .toLowerCase()
+    .replace(/:\d+$/, "");
+  if (!domain) return false;
+
+  const own =
+    typeof window !== "undefined" && window.location
+      ? String(window.location.hostname || "").toLowerCase()
+      : "";
+
+  if (own && domain === own) return true;
+
+  return LOCAL_HOSTS.has(domain) && (!own || LOCAL_HOSTS.has(own));
+}
+
 function checkInitiation(event) {
   if (!state.sessionStartedAt || !state.intent) return;
+  if (isOwnAppTab(event)) return;
 
   const ts = new Date(event.ts).getTime();
   if (Number.isNaN(ts) || ts < state.sessionStartedAt) return;
@@ -880,6 +927,35 @@ export function applyAmendResult(result = {}) {
   notify();
 }
 
+/*
+ * Add one if-then plan to the live session (the friction check's plan).
+ *
+ * It goes into BOTH state.plans (what the Re-entry panel's "If you get
+ * stuck" tile shows) and agentSession.plans (what amend reads and returns),
+ * so the next amend turn keeps it instead of overwriting it. Duplicates are
+ * ignored. Extra fields (source, pattern) are dropped: plans stay {if, then}.
+ */
+export function addSessionPlan(plan) {
+  if (!plan || !(plan.if || plan.then) || state.intent === null) return;
+
+  const key = (p) =>
+    `${p?.if ?? ""}|${p?.then ?? ""}`.trim().toLowerCase();
+  if (state.plans.some((p) => key(p) === key(plan))) return;
+
+  const clean = { if: plan.if, then: plan.then };
+  state.plans = [...state.plans, clean];
+
+  if (state.agentSession) {
+    state.agentSession = {
+      ...state.agentSession,
+      plans: [...(state.agentSession.plans || []), clean],
+    };
+  }
+
+  persistNow();
+  notify();
+}
+
 /* =====================================================
    NIGHTLY DATA
 ===================================================== */
@@ -894,6 +970,14 @@ export function getActivityHistory() {
 export function getNightlySessions() {
   return readJson(
     NIGHTLY_SESSIONS_KEY,
+    []
+  );
+}
+
+// Every finished session, for the friction check (see SESSION_LOG_KEY).
+export function getSessionLog() {
+  return readJson(
+    SESSION_LOG_KEY,
     []
   );
 }
@@ -1006,6 +1090,38 @@ function archiveCurrentSession(reason) {
     sessions.push(record);
     writeJson(NIGHTLY_SESSIONS_KEY, sessions.slice(-100));
     sendExperimentRecord(record);
+  }
+
+  /* -----------------------------------------------
+     SESSION LOG (friction check)
+     Every session, with or without a condition. It stays in this browser:
+     the friction check reads it from here. The block above is unchanged.
+  ------------------------------------------------ */
+
+  if (state.sessionStartedAt) {
+    const log = readJson(SESSION_LOG_KEY, []);
+
+    log.push({
+      started_at: new Date(state.sessionStartedAt).toISOString(),
+      // Same end as the experiment record: when it reached done, if it did.
+      // frictionStore leaves out tabs after this, so browsing after the work
+      // was finished is never read as part of it.
+      ended_at: new Date(state.doneAt || endedAt).toISOString(),
+      intent: state.intent,
+      condition: state.condition,
+      // Same definition as the experiment record.
+      initiation_latency_s: state.firstActionAt
+        ? Math.max(
+            0,
+            Math.round((state.firstActionAt - state.sessionStartedAt) / 1000)
+          )
+        : null,
+      event_count: state.events.length,
+      initiation_capped:
+        !state.firstActionAt && initiationChecks() >= MAX_INITIATION_CHECKS,
+    });
+
+    writeJson(SESSION_LOG_KEY, log.slice(-100));
   }
 }
 
