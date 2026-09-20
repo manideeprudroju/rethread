@@ -6,7 +6,7 @@
   "permissions": ["tabs"],
   "host_permissions": [
     "http://localhost:5173/*",
-    "https://main.YOUR-APP-ID.amplifyapp.com/*"
+    "https://main.d16k496u63q21s.amplifyapp.com/*"
   ],
   "background": {
     "service_worker": "background.js"
@@ -15,7 +15,7 @@
     {
       "matches": [
         "http://localhost:5173/*",
-        "https://main.YOUR-APP-ID.amplifyapp.com/*"
+        "https://main.d16k496u63q21s.amplifyapp.com/*"
       ],
       "js": ["content-script.js"],
       "run_at": "document_idle"
