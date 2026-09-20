@@ -12,7 +12,8 @@ Two ways in:
     public URL cannot reach this path.
 
 DynamoDB layout (table RethreadData, PK userId, SK recordKey):
-  SESSION#<ms>-<rand>   chat session object (updated each turn)
+  SESSION#<ms>-<rand>   one session: saved when it starts, after each chat
+                        turn, and when it ends (history reads these back)
   EXP#<started_at ISO>  one finished session's measurements (log_session)
   NIGHTLY#latest        last nightly result for the user
 
@@ -40,6 +41,7 @@ IAM (execution role), on this table only:
 
 import json
 import os
+import re
 import time
 import uuid
 from datetime import datetime
@@ -172,13 +174,13 @@ def _new_session_id():
 
 
 def _persist_session(user_id, session):
-    """Persist server-produced session state under the Cognito subject.
+    """Persist session state under the Cognito subject. Returns True if saved.
 
     Best effort, on purpose: the user already has a good answer from the
     model, and a storage failure must not turn that into a 500.
     """
     if not isinstance(session, dict):
-        return
+        return False
     try:
         _ddb_table.put_item(
             Item={
@@ -189,8 +191,10 @@ def _persist_session(user_id, session):
                 "session": _to_ddb(session),
             }
         )
+        return True
     except Exception as e:
         print(f"[ddb] session persist failed: {type(e).__name__}: {e}")
+        return False
 
 
 def _query_all(**kwargs):
@@ -807,6 +811,74 @@ def _handle_guide(body):
     return run_guide(body, _guide_model)
 
 
+# ---------------------------------------------------------------------------
+# Session history: every session, on every device
+# ---------------------------------------------------------------------------
+
+# Same shape as _new_session_id(): 13-digit epoch ms, dash, 8 hex. The
+# browser makes the id when a session starts, so the start save, every chat
+# turn and the end save all land on the same SESSION# item.
+_SESSION_ID_RE = re.compile(r"^\d{13}-[0-9a-f]{8}$")
+MAX_SESSION_BYTES = 100_000
+
+
+def _handle_save_session(body):
+    """Save the browser's session object under this user.
+
+    Called when a session starts and when it ends. Before this, a session
+    reached DynamoDB only after its first chat turn, so a session with no
+    chat existed in one browser only, and nothing followed the user to
+    another device. The tab timeline is never part of this object.
+    """
+    user_id = body["_authenticated_user_id"]
+    session = body.get("session")
+    if not isinstance(session, dict):
+        raise ValueError("session must be an object")
+    if len(json.dumps(session, default=_json_default)) > MAX_SESSION_BYTES:
+        raise ValueError("session is too large to save")
+    session = dict(session)
+    sid = session.get("session_id")
+    if not isinstance(sid, str) or not _SESSION_ID_RE.match(sid):
+        session["session_id"] = _new_session_id()
+    saved = _persist_session(user_id, session)
+    return {"saved": saved, "session_id": session["session_id"]}
+
+
+def _handle_history(body):
+    """This user's sessions, newest first, so the dashboard can show them on
+    any device and pick an unfinished one back up. Goal, step, plans, chat
+    and how it ended; no tab timeline (that stays in the browser)."""
+    user_id = body["_authenticated_user_id"]
+    try:
+        limit = int(body.get("limit") or 30)
+    except (TypeError, ValueError):
+        limit = 30
+    limit = max(1, min(limit, 100))
+    resp = _ddb_table.query(
+        KeyConditionExpression=(Key("userId").eq(user_id)
+                                & Key("recordKey").begins_with("SESSION#")),
+        ScanIndexForward=False,
+        Limit=limit,
+    )
+    sessions = []
+    for item in _from_ddb(resp.get("Items", [])):
+        s = item.get("session")
+        if not isinstance(s, dict):
+            continue
+        sessions.append({
+            "session_id": s.get("session_id"),
+            "started_at": s.get("started_at"),
+            "ended_at": s.get("ended_at"),
+            "end_reason": s.get("end_reason"),
+            "updated_at": item.get("updatedAt"),
+            "done": bool(s.get("done")),
+            "goal": s.get("declared_intent"),
+            "first_action": s.get("first_action"),
+            "session": s,
+        })
+    return {"sessions": sessions}
+
+
 _HANDLERS = {
     "decompose": _handle_decompose,
     "churn": _handle_churn,
@@ -822,6 +894,8 @@ _HANDLERS = {
     "friction": _handle_friction,
     "heavy": _handle_heavy,
     "guide": _handle_guide,
+    "save_session": _handle_save_session,
+    "history": _handle_history,
 }
 
 

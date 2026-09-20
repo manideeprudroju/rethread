@@ -10,7 +10,8 @@ What it does, in order:
      experiment_probe, decompose_guardrail and reentry_validate.
   3. Your real lambda_handler imports and routes friction, heavy and guide
      end to end, with the Cognito check and the model replaced by fakes.
-     This also proves every agent call starts with an empty history.
+     This also proves every agent call starts with an empty history. Then
+     save_session and history against an in-memory table (no DynamoDB).
   4. Every local module the handler actually imported is in deploy.bat's
      MODULES list, so nothing is missing from the zip.
 
@@ -199,6 +200,64 @@ if lh is not None:
          calls and all(n == 0 for n in calls), calls)
     step("one agent per role, reused across calls",
          len({a.role for a in agents}) == len(agents), [a.role for a in agents])
+
+    # ----------------------------------------------------------------------
+    print()
+    print("=" * 74)
+    print("3b. SESSIONS ON THE ACCOUNT (save_session, history), in-memory table")
+    print("=" * 74)
+
+    class MemTable:
+        """Just enough of the DynamoDB table for these actions."""
+        def __init__(self):
+            self.items = {}
+
+        @staticmethod
+        def _match(cond, item):
+            ex = cond.get_expression()
+            op, vals = ex["operator"], ex["values"]
+            if op == "AND":
+                return MemTable._match(vals[0], item) and MemTable._match(vals[1], item)
+            if op == "=":
+                return item.get(vals[0].name) == vals[1]
+            if op == "begins_with":
+                return str(item.get(vals[0].name, "")).startswith(vals[1])
+            raise NotImplementedError(op)
+
+        def put_item(self, Item):
+            self.items[(Item["userId"], Item["recordKey"])] = json.loads(json.dumps(Item, default=str))
+
+        def query(self, KeyConditionExpression, ScanIndexForward=True, Limit=None, **kw):
+            rows = sorted((v for v in self.items.values() if self._match(KeyConditionExpression, v)),
+                          key=lambda r: r["recordKey"], reverse=not ScanIndexForward)
+            return {"Items": rows[:Limit] if Limit else rows}
+
+    real_table, lh._ddb_table = lh._ddb_table, MemTable()
+    who = {"id": "local-test-user"}
+    lh._authenticate = lambda event: who["id"]
+    try:
+        sid = "1789900000000-0a1b2c3d"
+        start = {"session_id": sid, "started_at": "2026-09-20T10:30:00.000Z", "ended_at": None,
+                 "declared_intent": "write the Q3 summary report", "notes": "Where: Google Docs",
+                 "first_action": "Open the Q3 summary doc", "plans": [], "history": [], "done": False}
+        code, out = call("save_session", session=start)
+        step("save_session stores a new session under the browser's id",
+             code == 200 and out.get("saved") and out.get("session_id") == sid, (code, out))
+        code, out = call("save_session", session={**start, "ended_at": "2026-09-20T11:00:00.000Z",
+                                                  "end_reason": "stopped"})
+        code, out = call("history")
+        rows = out.get("sessions", []) if code == 200 else []
+        step("history returns it, with its end, from the same item",
+             len(rows) == 1 and rows[0]["session_id"] == sid and rows[0]["ended_at"]
+             and rows[0]["goal"] == "write the Q3 summary report", (code, str(out)[:200]))
+        who["id"] = "someone-else"
+        code, out = call("history")
+        step("another account sees none of it", code == 200 and out.get("sessions") == [], (code, out))
+        code, out = call("save_session", session="nope")
+        step("a malformed session is a 400", code == 400, (code, out))
+    finally:
+        lh._ddb_table = real_table
+        lh._authenticate = lambda event: "local-test-user"
 
     # ----------------------------------------------------------------------
     print()

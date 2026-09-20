@@ -41,6 +41,8 @@ One AWS Lambda function (`rethread-agents`, Python 3.12, handler `lambda_handler
 | `friction` | Weekly pattern check and one if-then plan for the next session | 0 on a quiet day, else 1 (+1 repair) |
 | `heavy` | User tapped "this one feels heavy": one plan for now | 1 |
 | `guide` | Chat answer from the trusted index | 0 for safety replies, else 1 |
+| `save_session` | Saves the browser's session object (`SESSION#<session_id>`) when a session starts and when it ends. Rejects anything over 100 KB; a malformed id gets a fresh one | 0 |
+| `history` | This user's sessions, newest first (`limit`, default 30, max 100): goal, step, start, end and the full session object, so the dashboard can list them and continue an unfinished one on any device | 0 |
 
 An unknown action returns 400 with the list of valid actions.
 
@@ -70,11 +72,13 @@ One DynamoDB table, `RethreadData`: partition key `userId`, sort key `recordKey`
 
 | `recordKey` | Holds |
 |---|---|
-| `SESSION#<ms>-<rand>` | The chat session object, updated every turn |
+| `SESSION#<ms>-<rand>` | One session: saved when it starts (`save_session`), after every chat turn, and when it ends. Holds goal, where and when, step, plans, chat turns, `started_at`, `ended_at`, `end_reason`. The browser makes the id, so all three saves update one item. |
 | `EXP#<started_at>` | One finished session's measurements (condition, time to start, duration, ended how). No goal, location or due date. |
 | `NIGHTLY#latest` | The latest nightly result for that user |
 
 The tab timeline is never stored here. The friction check receives it for one call and discards it.
+
+On sign-in the dashboard calls `history`, lists the sessions, and continues the newest one if it is unfinished, started in the last 12 hours, and wasn't ended in that browser. A session continued on a second device sends no experiment record from there: its start happened on the first device, and a second record would overwrite the one measured there.
 
 ## Environment variables
 
