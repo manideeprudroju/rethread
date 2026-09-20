@@ -28,7 +28,8 @@ and cryptography are compiled):
     cd package && zip -rq ../deployment.zip . && cd ..
     zip -g deployment.zip lambda_handler.py model_provider.py seq_check.py \
       decompose_guardrail.py drift_probe.py reentry_probe.py reentry_validate.py \
-      initiate_probe.py experiment_probe.py analyst_probe.py
+      initiate_probe.py experiment_probe.py analyst_probe.py friction_probe.py \
+      guide_probe.py
 
 PyJWT without [crypto] cannot verify RS256. The auth `except` turns that
 into a 401 on every request, which looks exactly like a bad token.
@@ -73,6 +74,7 @@ from initiate_probe import validate_initiate
 from analyst_probe import ANALYST_PROMPT, AnalystOutput
 from analyst_probe import build_user as build_analyst_user
 from analyst_probe import validate_analyst
+from friction_probe import run_friction, run_heavy
 
 # ---------------------------------------------------------------------------
 # Cognito + DynamoDB
@@ -240,7 +242,14 @@ _agents = {}
 def _agent(role, system_prompt):
     if role not in _agents:
         _agents[role] = _build_agent(role, system_prompt)
-    return _agents[role]
+    agent = _agents[role]
+    # A Strands Agent keeps its conversation between calls. Reused across
+    # warm invocations, every call carried all the earlier ones: more tokens,
+    # worse judgements, and one user's tab titles and goals inside another
+    # user's model call. Every action is stateless (the client carries the
+    # session), so each call starts clean.
+    agent.messages.clear()
+    return agent
 
 
 class Plan(BaseModel):
@@ -757,6 +766,47 @@ def _run_nightly(sessions, opts):
     return {**result, "writeup": out}
 
 
+def _friction_model(system, user):
+    """The one model call friction makes. Plain text, parsed and validated
+    inside friction_probe, which falls back to its own template on any error."""
+    return str(_agent("friction", system)(user))
+
+
+def _handle_friction(body):
+    """Nightly friction check, run on the first dashboard open of the day.
+
+    Detectors, protocol and gate are pure Python; at most one model call
+    (plus one repair). Quiet day = zero calls. Stores nothing: the tab
+    timeline is read and discarded, never written to DynamoDB. It can't run
+    from the EventBridge path for the same reason -- only the browser has it.
+    """
+    # Seed the arm order with the Cognito id, like assign does, so nobody
+    # can choose theirs. Whatever the browser sent is ignored.
+    body["user_id"] = body["_authenticated_user_id"]
+    return run_friction(body, _friction_model)
+
+
+def _handle_heavy(body):
+    """The user tapped 'this one feels heavy'. User-stated, never inferred."""
+    body["user_id"] = body["_authenticated_user_id"]
+    return run_heavy(body, _friction_model)
+
+
+def _guide_model(system, user):
+    return str(_agent("guide", system)(user))
+
+
+def _handle_guide(body):
+    """The guide chat in the Friction panel. Answers only from the trusted
+    index in guide_probe; self-harm, medication and "do I have ADHD?" get
+    fixed replies before any model call. One call per message at most (plus
+    one repair). Stores nothing."""
+    # Imported here, not at the top: a problem in the guide can only break
+    # the guide, never the other actions.
+    from guide_probe import run_guide
+    return run_guide(body, _guide_model)
+
+
 _HANDLERS = {
     "decompose": _handle_decompose,
     "churn": _handle_churn,
@@ -769,6 +819,9 @@ _HANDLERS = {
     "log_session": _handle_log_session,
     "drift": _handle_drift,
     "reentry": _handle_reentry,
+    "friction": _handle_friction,
+    "heavy": _handle_heavy,
+    "guide": _handle_guide,
 }
 
 

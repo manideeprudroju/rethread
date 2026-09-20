@@ -13,7 +13,7 @@ If Bedrock support later unblocks bedrock-runtime, flip PROVIDER to
 Env overrides (no code edit needed):
     PROBE_PROVIDER    bedrock_mantle | bedrock
     PROBE_REGION      default us-east-1
-    DECOMPOSE_MODEL / DRIFT_MODEL / REENTRY_MODEL
+    DECOMPOSE_MODEL / DRIFT_MODEL / REENTRY_MODEL / FRICTION_MODEL / GUIDE_MODEL
 """
 
 import os
@@ -41,6 +41,12 @@ MANTLE_MODELS = {
     "amend": os.environ.get("AMEND_MODEL", "deepseek.v3.2"),
     # The two-question opening turn.
     "clarify": os.environ.get("CLARIFY_MODEL", "deepseek.v3.2"),
+    # Nightly friction check. At most one call a night (plus one repair), and
+    # it writes the plan the user will act on, so same bar as the analyst.
+    "friction": os.environ.get("FRICTION_MODEL", "deepseek.v3.2"),
+    # The guide chat in the Friction panel. One call per message, answers
+    # only from the sources it is handed, validated before it's shown.
+    "guide": os.environ.get("GUIDE_MODEL", "deepseek.v3.2"),
 }
 
 # Converse ids, for if/when bedrock-runtime is unblocked.
@@ -51,6 +57,8 @@ BEDROCK_MODELS = {
     "analyst": "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
     "amend": "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
     "clarify": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+    "friction": "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+    "guide": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
 }
 
 
@@ -61,11 +69,14 @@ BEDROCK_MODELS = {
 # to go back without a code change.
 TEMPERATURES = {
     "amend": float(os.environ.get("AMEND_TEMPERATURE", "0.4")),
+    # A chat, so the same room as amend. Its validator checks every reply.
+    "guide": float(os.environ.get("GUIDE_TEMPERATURE", "0.4")),
 }
 
 
 def build_model(role, model_id=None, region=None, max_tokens=None):
-    """role: 'decompose' | 'drift' | 'reentry' | 'analyst' | 'amend' | 'clarify'."""
+    """role: 'decompose' | 'drift' | 'reentry' | 'analyst' | 'amend' | 'clarify'
+    | 'friction' | 'guide'."""
     region = region or REGION
     temperature = TEMPERATURES.get(role, 0)
 
