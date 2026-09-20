@@ -62,9 +62,10 @@ export default function NightlySummaryPanel({ onBack }) {
 
   useEffect(() => {
     loadLocalData();
-    if (getNightlySessions().length > 0) {
-      runNightly();
-    }
+    // Always ask the server: the experiment records live in DynamoDB, so the
+    // analysis is there on any device or site address, even when this
+    // browser has no sessions saved locally.
+    runNightly();
   }, []);
 
   async function runNightly() {
@@ -192,7 +193,7 @@ export default function NightlySummaryPanel({ onBack }) {
 
         {activities.length === 0 ? (
           <div style={{ marginTop: 18, padding: 18, borderRadius: 12, background: "#FFFFFF", color: "#8A8578", fontSize: 13.5 }}>
-            No captured activity yet. The extension will add title, domain, and timestamp events as tabs change.
+            No captured activity in this browser yet. The extension will add title, domain, and timestamp events as tabs change. Tab activity stays in the browser that recorded it; it is never sent to the server to be stored.
           </div>
         ) : (
           <div style={{ marginTop: 18, maxHeight: 280, overflowY: "auto", background: "#FFFFFF", border: "1px solid #E4E1D7", borderRadius: 12 }}>
@@ -234,14 +235,14 @@ export default function NightlySummaryPanel({ onBack }) {
           </button>
         </div>
 
-        {sessions.length === 0 ? (
+        {sessions.length === 0 && !analysis ? (
           <div style={{ marginTop: 18, padding: 16, borderRadius: 12, background: "#FFFFFF", border: "1px solid #E4E1D7", color: "#8A8578", fontSize: 13.5 }}>
             Session-level experiment data will appear here after completed sessions are recorded.
           </div>
         ) : (
           <div style={{ marginTop: 18 }}>
             <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 10 }}>
-              {Object.entries(analysis?.counts || sessions.reduce((acc, s) => {
+              {Object.entries(analysis?.total_counts || analysis?.counts || sessions.reduce((acc, s) => {
                 acc[s.condition] = (acc[s.condition] || 0) + 1;
                 return acc;
               }, {})).map(([condition, count]) => (
