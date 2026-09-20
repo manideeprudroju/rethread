@@ -221,3 +221,17 @@ export async function heavy(payload) {
 export async function guide({ message, history = [] }) {
   return callAgent("guide", { message, history });
 }
+
+// ---------------------------------------------------------------------------
+// save_session / history — every session on the user's account, so it can be
+// listed, and an unfinished one continued, on any device. sessionStore calls
+// both. The tab timeline is never sent: it stays in the browser.
+// ---------------------------------------------------------------------------
+
+export async function saveSession(session) {
+  return callAgent("save_session", { session });
+}
+
+export async function history({ limit = 30 } = {}) {
+  return callAgent("history", { limit });
+}

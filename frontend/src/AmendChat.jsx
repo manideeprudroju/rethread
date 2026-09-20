@@ -90,16 +90,33 @@ function Bubble({ role, children }) {
   );
 }
 
-export default function AmendChat({ onDone }) {
-  const session = getSessionForAmend();
-  const [messages, setMessages] = useState([
+/*
+ * The conversation so far, rebuilt from the session's own turns. The session
+ * object is what the backend remembers and what is saved to the account, so
+ * the chat is still there after leaving this screen, after a reload, and on
+ * another device.
+ */
+function messagesFromSession(session) {
+  const out = [
     {
       role: "assistant",
       text: `You're working on: ${
         session.declared_intent || "your current task"
       }. What’s happening?`,
     },
-  ]);
+  ];
+  for (const turn of session.history || []) {
+    if (turn?.said) out.push({ role: "user", text: turn.said });
+    const reply = turn?.response || turn?.note;
+    if (reply) out.push({ role: "assistant", text: reply });
+  }
+  return out;
+}
+
+export default function AmendChat({ onDone }) {
+  const [messages, setMessages] = useState(() =>
+    messagesFromSession(getSessionForAmend())
+  );
   const [message, setMessage] = useState("");
   const [state, setState] = useState("idle");
   const bottomRef = useRef(null);
@@ -122,22 +139,27 @@ export default function AmendChat({ onDone }) {
         message: text,
       });
 
+      // The WHOLE result: its `session` carries the chat so far, which is
+      // the agent's memory on the next turn and what the account saves.
+      // Passing only first_action and plans dropped it, so every turn
+      // started from nothing.
+      applyAmendResult(result);
+
       if (result.kind === "done") {
         setMessages((prev) => [
           ...prev,
-          { role: "assistant", text: result.note || "Session complete." },
+          { role: "assistant", text: result.response || result.note || "Session complete." },
         ]);
+        // Done is already recorded (applyAmendResult logs the finished
+        // session); this archives it and returns to the dashboard.
         endSession();
         onDone?.();
         return;
       }
 
-      applyAmendResult({
-        first_action: result.first_action,
-        plans: result.plans,
-      });
-
-      const response = result.note || "";
+      // `response` is the chat reply; `note` is an internal record the user
+      // was never meant to see.
+      const response = result.response || result.note || "";
 
       setMessages((prev) => [
         ...prev,

@@ -1,6 +1,6 @@
 // sessionStore.js
 
-import { drift, logSession } from "./api";
+import { drift, logSession, saveSession, history as fetchHistory } from "./api";
 
 const state = {
   intent: null,
@@ -31,6 +31,10 @@ const state = {
 
   // Tabs already judged for initiation this session (see checkInitiation).
   initiationChecked: {},
+
+  // Picked up from the account after starting on another device. This
+  // browser never saw it start, so it takes no start-time measurement.
+  restored: false,
 };
 
 const listeners = new Set();
@@ -54,6 +58,15 @@ const SESSION_LOG_KEY =
 // The live session, so a reload or a crash doesn't lose it.
 const ACTIVE_SESSION_KEY =
   "rethread_active_session_v1";
+
+// Sessions ended in this browser. One of them is never picked back up from
+// the account, even if its end didn't reach the server.
+const ENDED_SESSIONS_KEY =
+  "rethread_ended_sessions_v1";
+
+// An unfinished session on the account is continued here only if it started
+// this recently. Older ones are listed, not reopened.
+const RESTORE_WINDOW_MS = 12 * 60 * 60 * 1000;
 
 const PERSIST_MAX_EVENTS = 500;
 const PERSIST_MAX_CHAT = 200;
@@ -91,10 +104,20 @@ export function bindUser(sub) {
 
   currentUser = sub;
 
+  // Another person's list must never show, even for a moment.
+  serverSessions = [];
+  serverStatus = "idle";
+
   // Drop whatever an earlier user left in memory, then load this user's.
   clearSessionState();
   restoreActiveSession();
   notify();
+
+  // Then this account's sessions from DynamoDB, from any device. After this
+  // render, not during it.
+  setTimeout(() => {
+    syncFromServer();
+  }, 0);
 }
 
 // The Cognito id bindUser() was given, or null. frictionStore.js keys its
@@ -188,6 +211,7 @@ function persistNow() {
     sessionStartedAt: state.sessionStartedAt,
     firstActionAt: state.firstActionAt,
     initiationChecked: state.initiationChecked,
+    restored: state.restored,
   });
 }
 
@@ -211,6 +235,7 @@ function applySaved(saved) {
     saved.initiationChecked && typeof saved.initiationChecked === "object"
       ? saved.initiationChecked
       : {};
+  state.restored = !!saved.restored;
 
   if (state.running) startTicking();
 }
@@ -285,6 +310,8 @@ function clearSessionState() {
 
   state.initiationChecked = {};
   initiationPending.clear();
+
+  state.restored = false;
 }
 
 /* =====================================================
@@ -529,6 +556,9 @@ export function isOwnAppTab(event) {
 
 function checkInitiation(event) {
   if (!state.sessionStartedAt || !state.intent) return;
+  // Continued from another device: the start happened there, so there is
+  // nothing to measure here.
+  if (state.restored) return;
   if (isOwnAppTab(event)) return;
 
   const ts = new Date(event.ts).getTime();
@@ -625,6 +655,8 @@ export function createSession({
     archiveCurrentSession("replaced");
   }
 
+  const startedAt = Date.now();
+
   state.intent = goal || null;
   state.location = location || null;
   state.dueDate = dueDate || null;
@@ -634,7 +666,7 @@ export function createSession({
   // Same shape as new_session() in initiate_probe.py.
   state.doneAt = null;
 
-  state.agentSession = session || {
+  const base = session || {
     declared_intent: goal || null,
     // The backend grounds every chat turn on `notes`: a file or doc the
     // model may name has to appear in something the user said. Location and
@@ -648,6 +680,18 @@ export function createSession({
     history: [],
     done: false,
   };
+
+  // Plus what lets the account keep it: an id made here, so the start save,
+  // every chat turn and the end save all update one DynamoDB item; when it
+  // started; and where and when, so another device can show them.
+  state.agentSession = {
+    ...base,
+    session_id: base.session_id || newSessionId(startedAt),
+    started_at: new Date(startedAt).toISOString(),
+    ended_at: null,
+    location: location || null,
+    due_date: dueDate || null,
+  };
   state.done = false;
 
   state.events = [];
@@ -658,14 +702,17 @@ export function createSession({
 
   state.condition = condition;
 
-  state.sessionStartedAt = Date.now();
+  state.sessionStartedAt = startedAt;
 
   state.firstActionAt = null;
 
   state.initiationChecked = {};
   initiationPending.clear();
 
+  state.restored = false;
+
   persistNow();
+  saveToServer(state.agentSession);
   notify();
 }
 
@@ -877,6 +924,8 @@ export function applyAmendResult(result = {}) {
 
   if (session && typeof session === "object") {
     state.agentSession = session;
+    // The backend saved this turn to the account; keep the list in step.
+    rememberServerSession(session);
 
     if (session.declared_intent) {
       state.intent = session.declared_intent;
@@ -996,6 +1045,9 @@ export function getSessionLog() {
  */
 function buildExperimentRecord(reason, now = Date.now()) {
   if (!state.condition || !state.sessionStartedAt) return null;
+  // Continued from another device: its start was never observed here, and
+  // sending a record would overwrite the one the first device measured.
+  if (state.restored) return null;
 
   const endedAt = state.doneAt || now;
 
@@ -1123,6 +1175,232 @@ function archiveCurrentSession(reason) {
 
     writeJson(SESSION_LOG_KEY, log.slice(-100));
   }
+
+  /* -----------------------------------------------
+     YOUR ACCOUNT
+     Mark it ended, so every device lists it as ended and none tries to
+     continue it.
+  ------------------------------------------------ */
+
+  if (state.agentSession && state.sessionStartedAt) {
+    const ended = {
+      ...state.agentSession,
+      ended_at: new Date(state.doneAt || endedAt).toISOString(),
+      end_reason: state.done ? "done" : reason || "ended",
+      done: !!(state.done || state.agentSession.done),
+    };
+    saveToServer(ended);
+    if (ended.session_id) {
+      const list = readJson(ENDED_SESSIONS_KEY, []);
+      list.push(ended.session_id);
+      writeJson(ENDED_SESSIONS_KEY, list.slice(-50));
+    }
+  }
+}
+
+/* =====================================================
+   SESSION HISTORY (your account, any device)
+===================================================== */
+
+/*
+ * Every session is saved to the user's account in DynamoDB when it starts,
+ * after each chat turn (the backend does that) and when it ends. So the
+ * dashboard can list them on any device, and an unfinished one from the
+ * last few hours is picked back up where you sign in.
+ *
+ * What is saved is the session object: goal, where and when, step, plans,
+ * chat. The tab timeline is not: it stays in the browser that recorded it.
+ */
+
+let serverSessions = []; // newest first, like the backend's `history`
+let serverStatus = "idle"; // "idle" | "loading" | "ready" | "error"
+
+export function getServerSessions() {
+  return serverSessions;
+}
+
+export function getServerStatus() {
+  return serverStatus;
+}
+
+// Same shape as the backend's _new_session_id(): epoch ms, dash, 8 hex.
+function newSessionId(ms) {
+  let hex = "";
+  for (let i = 0; i < 8; i++) {
+    hex += Math.floor(Math.random() * 16).toString(16);
+  }
+  return `${ms}-${hex}`;
+}
+
+function byNewest(a, b) {
+  return String(b.session_id).localeCompare(String(a.session_id));
+}
+
+function summarise(session) {
+  return {
+    session_id: session.session_id,
+    started_at: session.started_at || null,
+    ended_at: session.ended_at || null,
+    end_reason: session.end_reason || null,
+    done: !!session.done,
+    goal: session.declared_intent || null,
+    first_action: session.first_action || null,
+    session,
+  };
+}
+
+// Keep the list current without waiting for the next sign-in.
+function rememberServerSession(session) {
+  if (!session || typeof session !== "object" || !session.session_id) return;
+  const entry = summarise(session);
+  serverSessions = [
+    entry,
+    ...serverSessions.filter((s) => s.session_id !== entry.session_id),
+  ].sort(byNewest);
+}
+
+function saveToServer(session) {
+  if (!currentUser || !session || typeof session !== "object") return;
+  rememberServerSession(session);
+  saveSession(session).catch((err) => {
+    console.error("Could not save the session to your account:", err);
+  });
+}
+
+// The chat as the chat panel shows it, rebuilt from the session's own turns.
+function chatFromSession(session) {
+  const out = [];
+  for (const turn of session?.history || []) {
+    if (turn?.said) out.push({ role: "user", text: turn.said });
+    if (turn?.response) out.push({ role: "assistant", text: turn.response });
+  }
+  return out;
+}
+
+function endedHere(id) {
+  return readJson(ENDED_SESSIONS_KEY, []).includes(id);
+}
+
+/*
+ * The live session in this browser, checked against the account's copy.
+ * Another device may have moved it on or ended it since this browser last
+ * saw it. Without this, this browser carries on with its older copy: a
+ * session finished on the phone still shows as in progress on the laptop,
+ * and the laptop's next save puts it back on the account, re-opened and
+ * missing the phone's turns.
+ */
+function reconcileLiveSession() {
+  const mine = state.agentSession;
+  if (state.intent === null || !mine?.session_id) return;
+
+  const entry = serverSessions.find((s) => s.session_id === mine.session_id);
+  const theirs = entry?.session;
+  if (!theirs || typeof theirs !== "object") return;
+
+  if (entry.ended_at || entry.done) {
+    // Ended on another device: end it here too, with that device's copy and
+    // end time. This browser saw it start, so it sends the experiment record
+    // (the device that continued it sends none).
+    const endedMs = Date.parse(entry.ended_at);
+    const savedMs = Number(entry.updated_at) * 1000;
+    state.agentSession = theirs;
+    state.done = !!entry.done;
+    state.doneAt = Number.isFinite(endedMs)
+      ? endedMs
+      : savedMs > 0
+        ? savedMs
+        : Date.now();
+    endSession(entry.end_reason || (entry.done ? "done" : "ended"));
+    return;
+  }
+
+  const turns = (s) => (Array.isArray(s?.history) ? s.history.length : 0);
+  if (turns(theirs) > turns(mine)) {
+    // Moved on elsewhere (more chat turns there): carry on from that copy.
+    state.agentSession = theirs;
+    if (theirs.declared_intent) state.intent = theirs.declared_intent;
+    state.firstAction = theirs.first_action ?? state.firstAction;
+    state.plans = Array.isArray(theirs.plans) ? theirs.plans : state.plans;
+    state.chatHistory = chatFromSession(theirs);
+    persistNow();
+  }
+}
+
+/*
+ * Continue the account's newest session here, if it is unfinished, started
+ * in the last few hours, and this browser has no live session of its own.
+ * Only the newest: an older unfinished one was left behind for a newer one.
+ */
+function restoreOpenSessionFromServer() {
+  if (state.intent !== null || state.sessionStartedAt) return;
+
+  const newest = serverSessions[0];
+  if (!newest || newest.done || newest.ended_at) return;
+  if (endedHere(newest.session_id)) return;
+
+  const session = newest.session;
+  const started = Date.parse(newest.started_at);
+  if (!session || typeof session !== "object" || !session.declared_intent) return;
+  if (!Number.isFinite(started) || Date.now() - started > RESTORE_WINDOW_MS) return;
+
+  state.intent = session.declared_intent;
+  state.location = session.location ?? null;
+  state.dueDate = session.due_date ?? null;
+  state.firstAction = session.first_action ?? null;
+  state.plans = Array.isArray(session.plans) ? session.plans : [];
+  state.agentSession = session;
+  state.done = false;
+  state.doneAt = null;
+  state.condition = session.condition ?? null;
+  state.sessionStartedAt = started;
+  state.firstActionAt = null;
+  state.events = []; // the tab timeline stays on the device that recorded it
+  state.chatHistory = chatFromSession(session);
+  // The session's clock carries on from when it started on the other device.
+  state.elapsedSeconds = Math.max(0, Math.round((Date.now() - started) / 1000));
+  state.running = true;
+  state.initiationChecked = {};
+  initiationPending.clear();
+  state.restored = true;
+
+  persistNow();
+  startTicking();
+}
+
+/*
+ * Load this account's sessions. Runs after sign-in; call it again to
+ * refresh. A failure leaves whatever the list already had.
+ */
+export async function syncFromServer() {
+  const user = currentUser;
+  if (!user) return;
+
+  serverStatus = "loading";
+  notify();
+
+  try {
+    const res = await fetchHistory({ limit: 30 });
+    if (currentUser !== user) return;
+
+    const byId = new Map(serverSessions.map((s) => [s.session_id, s]));
+    for (const s of Array.isArray(res?.sessions) ? res.sessions : []) {
+      if (!s || !s.session_id) continue;
+      const mine = byId.get(s.session_id);
+      // Ended here a moment ago and the server hasn't caught up: keep ours.
+      if (mine && mine.ended_at && !s.ended_at) continue;
+      byId.set(s.session_id, s);
+    }
+    serverSessions = [...byId.values()].sort(byNewest);
+    serverStatus = "ready";
+
+    reconcileLiveSession();
+    restoreOpenSessionFromServer();
+  } catch (err) {
+    console.error("Could not load your earlier sessions:", err);
+    if (currentUser === user) serverStatus = "error";
+  }
+
+  if (currentUser === user) notify();
 }
 
 /* =====================================================

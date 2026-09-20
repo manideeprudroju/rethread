@@ -8,6 +8,7 @@ import ReentryPanel from "./ReentryPanel";
 import AmendChat from "./AmendChat";
 import FrictionPanel from "./FrictionPanel";
 import NightlySummaryPanel from "./NightlySummaryPanel";
+import SessionHistoryPanel from "./SessionHistoryPanel";
 import { attachPendingPlan } from "./frictionStore";
 import { bindUser } from "./sessionStore";
 // DriftPopup intentionally not mounted — on hold, see team discussion.
@@ -141,6 +142,10 @@ export default function App() {
             onStartNew={() => setView("intent")}
             onNightly={() => setView("nightly")}
           />
+
+          {/* Your sessions from DynamoDB, on any device. Continue appears on
+              the one in progress. */}
+          <SessionHistoryPanel onContinue={() => setView("session_return")} />
 
           <button
             onClick={() => setView("nightly")}
